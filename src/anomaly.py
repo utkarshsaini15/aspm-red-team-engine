@@ -66,10 +66,18 @@ class AnomalyDetector:
             "temperature_drift":   temp_drift,
         }
 
-    def analyze(self, vuln_type: str, is_exploited: bool, temperature: float) -> Dict:
-        """Run Z-score anomaly detection for one attack vector."""
+    def analyze(self, vuln_type: str, is_exploited: bool, temperature: float,
+                real_latency: float = None, real_tokens: int = None) -> Dict:
+        """Run Z-score anomaly detection. Uses real LLM metrics when provided."""
         metrics = self._simulate_metrics(vuln_type, is_exploited, temperature)
-        self.observations.append({**metrics, "vuln": vuln_type})
+
+        # Override simulated values with real measured metrics when available
+        if real_latency is not None:
+            metrics["response_time"] = round(real_latency, 3)
+        if real_tokens is not None:
+            metrics["token_count"] = int(real_tokens)
+
+        self.observations.append({**metrics, "vuln": vuln_type, "has_anomaly": False})
 
         checks = [
             ("response_time",    metrics["response_time"],
@@ -100,6 +108,10 @@ class AnomalyDetector:
                     "severity": _severity(z),
                 })
 
+        # Persist detection flag on the observation so summary() can count correctly
+        if anomalies:
+            self.observations[-1]["has_anomaly"] = True
+
         return {
             "vuln_type":        vuln_type,
             "metrics":          metrics,
@@ -126,6 +138,5 @@ class AnomalyDetector:
             "std_response_time":  round(std(times),   3),
             "avg_token_count":    round(mean(tokens),  1),
             "std_token_count":    round(std(tokens),   1),
-            "anomalies_total":    sum(1 for o in self.observations
-                                      if any(True for _ in [])),  # counted inline
+            "anomalies_total":    sum(1 for o in self.observations if o.get("has_anomaly", False)),
         }

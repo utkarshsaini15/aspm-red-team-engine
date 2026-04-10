@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from sqlmodel import Field, SQLModel
 import uuid
@@ -9,5 +9,5 @@ class ScanJob(SQLModel, table=True):
     status: str = Field(default="PENDING") # PENDING, IN_PROGRESS, COMPLETED, FAILED
     results: Optional[str] = None # JSON string of results
     logs: str = Field(default="") # Streaming text logs
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None

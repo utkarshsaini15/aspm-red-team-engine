@@ -7,7 +7,7 @@ Integrates: Q-Learning Engine + Multi-Agent System + Genetic Mutator
 import asyncio
 import json
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import AsyncGenerator, Tuple, Optional
 
 from src.rl_engine import QLearningEngine
@@ -15,9 +15,19 @@ from src.payload_mutator import PayloadMutator
 from src.anomaly import AnomalyDetector
 from src.xai import XAIExplainer
 from src.agents import (
-    compute_pass_fail, VULN_NAMES, MITIGATIONS, RISK_MAP,
+    VULN_NAMES, MITIGATIONS, RISK_MAP,
     ALL_AGENTS_ORDER, RedTeamAgent,
+    InjectorAgent, ExtractionAgent, DoSAgent, ToxicityAgent, SupplyChainAgent,
 )
+
+# Maps agent name strings → specialist agent classes
+_AGENT_CLASSES = {
+    "InjectorAgent":    InjectorAgent,
+    "ExtractionAgent":  ExtractionAgent,
+    "DoSAgent":         DoSAgent,
+    "ToxicityAgent":    ToxicityAgent,
+    "SupplyChainAgent": SupplyChainAgent,
+}
 
 
 def _hardened_prompt(failed_ids: list, temperature: float) -> str:
@@ -56,6 +66,7 @@ async def run_security_scan_generator(
     target_model: str,
     system_prompt: str = "",
     temperature: float = 0.5,
+    api_key: str = "",
 ) -> AsyncGenerator[Tuple[str, bool, Optional[str]], None]:
     """
     Master async generator — streams log lines, then final results JSON.
@@ -66,6 +77,9 @@ async def run_security_scan_generator(
     mutator  = PayloadMutator(mutation_rate=0.4)
     anomaly  = AnomalyDetector()
     xai      = XAIExplainer()
+
+    # Load persisted Q-table so each scan builds on prior learning
+    rl_loaded = rl.load()
 
     # ── Banner ────────────────────────────────────────────────────────────────
     yield ("╔══════════════════════════════════════════════════════════╗", False, None)
@@ -80,10 +94,12 @@ async def run_security_scan_generator(
            f"({'⚠ HIGH RISK' if temperature > 0.7 else '✓ Safe'})", False, None)
     yield (f"[INIT] System Prompt   : {len(system_prompt)} chars  "
            f"({'✓ Present' if system_prompt else '⚠ MISSING'})", False, None)
+    yield (f"[INIT] Scan Mode       : {'🤖 REAL LLM — live attacks' if api_key else '⚡ SIMULATION — keyword analysis'}", False, None)
     await asyncio.sleep(0.3)
 
     # ── Boot ML modules ───────────────────────────────────────────────────────
     yield ("\n[ML]   Booting Q-Learning Engine  (α=0.15, γ=0.9, ε=0.40) ...", False, None)
+    yield (f"[ML]   Q-Table: {'Resumed ' + str(len(rl.q_table)) + ' states from disk' if rl_loaded else 'No prior state — fresh start'}", False, None)
     yield ("[ML]   Booting Genetic Payload Mutator (mutation_rate=0.40) ...", False, None)
     yield ("[ML]   Booting Z-Score Anomaly Detector (baseline loaded)   ...", False, None)
     yield ("[ML]   Booting XAI Explainer (SHAP-style contributions)     ...", False, None)
@@ -94,10 +110,6 @@ async def run_security_scan_generator(
         yield (f"       ├── {agent_name:24s} → {', '.join(targets)}", False, None)
     await asyncio.sleep(0.3)
 
-    # ── Compute dynamic pass/fail ─────────────────────────────────────────────
-    pf = compute_pass_fail(system_prompt, temperature)
-    prompt_len = len(system_prompt)
-
     # ── Run agents in sequence (streaming logs) ───────────────────────────────
     vulnerabilities   = []
     anomaly_report    = []
@@ -105,7 +117,9 @@ async def run_security_scan_generator(
     evolution_log     = []
 
     for agent_name, targets in ALL_AGENTS_ORDER:
-        agent = RedTeamAgent(agent_name, targets, rl)
+        # Instantiate the correct specialist agent subclass
+        AgentClass = _AGENT_CLASSES.get(agent_name, RedTeamAgent)
+        agent = AgentClass(rl) if AgentClass is not RedTeamAgent else RedTeamAgent(agent_name, targets, rl)
         yield (f"\n[ORCH] Dispatching {agent_name} → {len(targets)} vector(s)", False, None)
         await asyncio.sleep(0.2)
 
@@ -113,9 +127,8 @@ async def run_security_scan_generator(
         agent_findings   = []
 
         for owasp_id in targets:
-            is_secure  = pf.get(owasp_id, True)
             lines, vuln, anom = await agent.attack_vector(
-                owasp_id, is_secure, prompt_len, temperature, mutator, anomaly
+                owasp_id, target_model, system_prompt, temperature, mutator, anomaly, api_key
             )
             for line in lines:
                 yield (line, False, None)
@@ -130,12 +143,11 @@ async def run_security_scan_generator(
                 "risk":     vuln["risk_level"],
             })
 
-            # Evolve log
+            # Evolve log — evolve() already resets generation_log internally
             evolution_log.append({
                 "vector": owasp_id,
-                "generations": mutator.generation_log,
+                "generations": list(mutator.generation_log),  # snapshot before next evolve
             })
-            mutator.generation_log = []
 
         agent_activity.append({
             "agent":    agent_name,
@@ -179,9 +191,10 @@ async def run_security_scan_generator(
 
     results = {
         "target":           target_model,
-        "completed_at":     datetime.utcnow().isoformat(),
+        "completed_at":     datetime.now(timezone.utc).isoformat(),
         "scan_engine":      "ASPM Red Team Engine v3.0",
         "temperature":      temperature,
+        "scan_mode":        "real_llm" if api_key else "simulation",
         "score":            score,
         "vulnerabilities":  vulnerabilities,
         "hardened_prompt":  hardened,
@@ -198,5 +211,8 @@ async def run_security_scan_generator(
         "rl_data":         ql_export,
         "evolution_log":   evolution_log[:5],   # keep compact
     }
+
+    # Persist Q-table for next scan — RL now genuinely learns across runs
+    rl.save()
 
     yield ("COMPLETE", True, json.dumps(results))

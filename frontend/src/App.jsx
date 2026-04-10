@@ -5,7 +5,7 @@ import {
   ChevronRight, Zap, AlertTriangle, CheckCircle2,
   XCircle, Copy, Check, Trash2, RefreshCw, Terminal,
   TrendingUp, Clock, Cpu, Brain, GitBranch,
-  Network, Layers, Bug, Shield, Play, Repeat
+  Network, Layers, Bug, Shield, Play, Repeat, Download
 } from 'lucide-react';
 import {
   ResponsiveContainer, AreaChart, Area, XAxis, YAxis,
@@ -36,7 +36,7 @@ function renderLog(raw) {
     if (/DEFENSE|BLOCK|DENY|Guardrail/.test(line)) cls = 'log-line log-defense';
     if (/RESULT|PASSED|FAILED/.test(line))       cls = 'log-line log-result';
     if (/═|SCAN COMPLETE|Score|Q-Table/.test(line)) cls = 'log-line log-final';
-    if (/PAYLOAD|→/.test(line))                  cls = 'log-line log-payload';
+    if (/PAYLOAD/.test(line))                  cls = 'log-line log-payload';
     if (/ANOMALY|XAI|RL\]/.test(line))           cls = 'log-line log-xai';
     if (/Mutator|Gen |evolution/.test(line))     cls = 'log-line log-mutator';
     return <span key={i} className={cls}>{line}{'\n'}</span>;
@@ -282,7 +282,7 @@ function AnomalyPanel({ anomalies }) {
 
 // ── Toast ──────────────────────────────────────────────────────────────────────
 function Toast({ message, type = 'success', onClose }) {
-  useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, []);
+  useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
   const icon = type === 'success' ? <CheckCircle2 size={15} color="var(--green)"/> : <AlertTriangle size={15} color="var(--yellow)"/>;
   return <div className="toast">{icon} {message}</div>;
 }
@@ -297,9 +297,10 @@ export default function App() {
   const [toast, setToast]         = useState(null);
 
   // Scan config
-  const [targetModel,   setTargetModel]   = useState('gpt-4o-customer-bot');
+  const [targetModel,   setTargetModel]   = useState('gpt-4o');
   const [temperature,   setTemperature]   = useState(0.5);
   const [systemPrompt,  setSystemPrompt]  = useState('');
+  const [apiKey,        setApiKey]        = useState('');
 
   // Primary scan
   const [scanId,     setScanId]     = useState(null);
@@ -337,47 +338,6 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
-  // ── Primary Scan Polling ────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!scanId || (scanStatus !== 'PENDING' && scanStatus !== 'IN_PROGRESS')) return;
-    const id = setInterval(async () => {
-      try {
-        const { data } = await axios.get(`${API}/scan/status/${scanId}`);
-        setLogs(data.logs || '');
-        setScanStatus(data.status);
-        if (data.status === 'COMPLETED') {
-          setResults(data.results);
-          fetchHistory();
-          showToast('Scan completed! Vulnerabilities identified.', 'success');
-        }
-        if (data.status === 'FAILED') showToast('Scan failed — check backend logs.', 'warn');
-      } catch {}
-    }, 900);
-    return () => clearInterval(id);
-  }, [scanId, scanStatus]);
-
-  // ── Hardened Scan Polling ───────────────────────────────────────────────────
-  useEffect(() => {
-    if (!hardenJobId || (hardenStatus !== 'PENDING' && hardenStatus !== 'IN_PROGRESS')) return;
-    const id = setInterval(async () => {
-      try {
-        const { data } = await axios.get(`${API}/scan/status/${hardenJobId}`);
-        setHardenLogs(data.logs || '');
-        setHardenStatus(data.status);
-        if (data.status === 'COMPLETED') {
-          setHardenResults(data.results);
-          fetchHistory();
-          showToast('Hardened scan complete! Compare scores below.', 'success');
-        }
-      } catch {}
-    }, 900);
-    return () => clearInterval(id);
-  }, [hardenJobId, hardenStatus]);
-
-  // ── Auto Scroll ─────────────────────────────────────────────────────────────
-  useEffect(() => { if (consoleRef.current) consoleRef.current.scrollTop = consoleRef.current.scrollHeight; }, [logs]);
-  useEffect(() => { if (hardenRef.current)  hardenRef.current.scrollTop  = hardenRef.current.scrollHeight;  }, [hardenLogs]);
-
   // ── History ─────────────────────────────────────────────────────────────────
   const fetchHistory = useCallback(async () => {
     try { const {data} = await axios.get(`${API}/scans/history`); setHistory(data); } catch {}
@@ -385,6 +345,89 @@ export default function App() {
   useEffect(() => { fetchHistory(); }, [fetchHistory]);
 
   const calcScore = v => v?.length ? Math.round(v.filter(x=>x.status==='Passed').length/v.length*100) : 0;
+
+  // ── Scan Result Fetchers (called by SSE handlers) ──────────────────────────
+  const fetchFinalResults = useCallback(async (id) => {
+    try {
+      const { data } = await axios.get(`${API}/scan/status/${id}`);
+      setScanStatus(data.status);
+      if (data.results) { setResults(data.results); fetchHistory(); showToast('Scan completed! Vulnerabilities identified.', 'success'); }
+    } catch {}
+  }, [fetchHistory]);
+
+  const fetchHardenFinalResults = useCallback(async (id) => {
+    try {
+      const { data } = await axios.get(`${API}/scan/status/${id}`);
+      setHardenStatus(data.status);
+      if (data.results) { setHardenResults(data.results); fetchHistory(); showToast('Hardened scan complete! Compare scores below.', 'success'); }
+    } catch {}
+  }, [fetchHistory]);
+
+  // ── Primary Scan — Real-time SSE Stream ─────────────────────────────────────
+  useEffect(() => {
+    if (!scanId) return;
+    const es = new EventSource(`${API}/scan/stream/${scanId}`);
+    let started = false;
+    es.onmessage = (e) => {
+      const line = e.data;
+      if (!started) { started = true; setScanStatus('IN_PROGRESS'); }
+      if      (line === '[DONE]')               { es.close(); fetchFinalResults(scanId); }
+      else if (line === '[FAIL]')               { es.close(); setScanStatus('FAILED'); showToast('Scan failed — check backend logs.', 'warn'); }
+      else if (line && !line.startsWith('[ERROR]')) { setLogs(prev => prev + line + '\n'); }
+    };
+    es.onerror = () => { es.close(); };
+    return () => es.close();
+  }, [scanId, fetchFinalResults]);
+
+  // ── Fallback Polling for Scan Status ───────────────────────────────────────
+  useEffect(() => {
+    if (!scanId || scanStatus === 'COMPLETED' || scanStatus === 'FAILED') return;
+    const id = setInterval(async () => {
+      try {
+        const { data } = await axios.get(`${API}/scan/status/${scanId}`);
+        if (data.status === 'COMPLETED' || data.status === 'FAILED') {
+          setScanStatus(data.status);
+          if (data.results) { setResults(data.results); fetchHistory(); }
+        }
+      } catch {}
+    }, 1500);
+    return () => clearInterval(id);
+  }, [scanId, scanStatus, fetchHistory]);
+
+  // ── Hardened Scan — Real-time SSE Stream ────────────────────────────────────
+  useEffect(() => {
+    if (!hardenJobId) return;
+    const es = new EventSource(`${API}/scan/stream/${hardenJobId}`);
+    let started = false;
+    es.onmessage = (e) => {
+      const line = e.data;
+      if (!started) { started = true; setHardenStatus('IN_PROGRESS'); }
+      if      (line === '[DONE]')               { es.close(); fetchHardenFinalResults(hardenJobId); }
+      else if (line === '[FAIL]')               { es.close(); setHardenStatus('FAILED'); }
+      else if (line && !line.startsWith('[ERROR]')) { setHardenLogs(prev => prev + line + '\n'); }
+    };
+    es.onerror = () => { es.close(); };
+    return () => es.close();
+  }, [hardenJobId, fetchHardenFinalResults]);
+
+  // ── Fallback Polling for Hardened Scan Status ───────────────────────────────
+  useEffect(() => {
+    if (!hardenJobId || hardenStatus === 'COMPLETED' || hardenStatus === 'FAILED') return;
+    const id = setInterval(async () => {
+      try {
+        const { data } = await axios.get(`${API}/scan/status/${hardenJobId}`);
+        if (data.status === 'COMPLETED' || data.status === 'FAILED') {
+          setHardenStatus(data.status);
+          if (data.results) { setHardenResults(data.results); fetchHistory(); }
+        }
+      } catch {}
+    }, 1500);
+    return () => clearInterval(id);
+  }, [hardenJobId, hardenStatus, fetchHistory]);
+
+  // ── Auto Scroll ─────────────────────────────────────────────────────────────
+  useEffect(() => { if (consoleRef.current) consoleRef.current.scrollTop = consoleRef.current.scrollHeight; }, [logs]);
+  useEffect(() => { if (hardenRef.current)  hardenRef.current.scrollTop  = hardenRef.current.scrollHeight;  }, [hardenLogs]);
 
   // ── Start Scan ──────────────────────────────────────────────────────────────
   const startScan = async () => {
@@ -396,6 +439,7 @@ export default function App() {
         target_model: targetModel,
         system_prompt: systemPrompt,
         temperature: parseFloat(temperature),
+        api_key: apiKey,
       });
       setScanId(data.job_id);
     } catch { setScanStatus(null); showToast('Cannot connect to backend API.', 'warn'); }
@@ -406,7 +450,7 @@ export default function App() {
     if (!scanId) return;
     setHardenStatus('PENDING'); setHardenLogs(''); setHardenResults(null);
     try {
-      const { data } = await axios.post(`${API}/scan/harden-and-verify/${scanId}`);
+      const { data } = await axios.post(`${API}/scan/harden-and-verify/${scanId}`, { api_key: apiKey });
       setHardenJobId(data.job_id);
       showToast('Auto-Hardening loop launched!', 'success');
     } catch { showToast('Harden scan failed.', 'warn'); }
@@ -433,7 +477,47 @@ export default function App() {
   }));
   const heatData = Object.entries(vectorMap).map(([k,v])=>({id:k,failures:v})).sort((a,b)=>b.failures-a.failures);
 
-  // ── RENDER ──────────────────────────────────────────────────────────────────
+  // ── Provider Comparison Data ───────────────────────────────────────────────
+  const detectProvider = (model) => {
+    const m = (model || '').toLowerCase().replace(' [hardened]', '');
+    if (m.includes('gemini'))                         return 'Gemini';
+    if (m.includes('claude') || m.includes('anthrop')) return 'Claude';
+    return 'GPT';
+  };
+
+  const PROVIDER_COLORS = { GPT: '#58a6ff', Gemini: '#3fb950', Claude: '#a371f7' };
+
+  // Build per-provider scan sequences
+  const providerScans = {};
+  [...history].reverse().forEach(h => {
+    const provider = detectProvider(h.target_model);
+    if (!providerScans[provider]) providerScans[provider] = [];
+    providerScans[provider].push({
+      score: calcScore(h.results?.vulnerabilities),
+      time: new Date(h.completed_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}),
+    });
+  });
+
+  // Build unified timeline — { scan: N, GPT: score|null, Gemini: score|null, Claude: score|null }
+  const maxLen = Math.max(...Object.values(providerScans).map(a => a.length), 0);
+  const comparisonData = [];
+  for (let i = 0; i < maxLen; i++) {
+    const point = { scan: `Scan ${i + 1}` };
+    for (const p of ['GPT', 'Gemini', 'Claude']) {
+      point[p] = providerScans[p]?.[i]?.score ?? null;
+    }
+    comparisonData.push(point);
+  }
+
+  // Per-provider averages
+  const providerAvg = {};
+  const providerCount = {};
+  for (const [p, scans] of Object.entries(providerScans)) {
+    providerAvg[p] = Math.round(scans.reduce((s, x) => s + x.score, 0) / scans.length);
+    providerCount[p] = scans.length;
+  }
+  const activeProviders = Object.keys(providerScans);
+
   return (
     <div className="app-shell">
 
@@ -506,8 +590,20 @@ export default function App() {
                 </div>
                 <div className="card-body">
                   <div className="form-group">
-                    <label className="form-label">Target Model URI</label>
-                    <input className="form-input" value={targetModel} onChange={e=>setTargetModel(e.target.value)} placeholder="gpt-4o-customer-bot"/>
+                    <label className="form-label">Target Model ID</label>
+                    <input className="form-input" value={targetModel} onChange={e=>setTargetModel(e.target.value)} placeholder="gpt-4o"/>
+                    <div className="form-hint">LiteLLM format: <code>gpt-4o</code> · <code>gemini/gemini-1.5-flash</code> · <code>anthropic/claude-3-sonnet</code></div>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">API Key <span className="form-hint-inline">(Optional — leave blank for simulation)</span></label>
+                    <input
+                      className="form-input" type="password"
+                      value={apiKey} onChange={e=>setApiKey(e.target.value)}
+                      placeholder="sk-...  or  AIzaSy...  or  any provider key"
+                    />
+                    <div className="form-hint" style={{color: apiKey ? 'var(--green)' : 'var(--yellow)'}}>
+                      {apiKey ? '🤖 Real LLM Mode — live attacks will call the target model' : '⚡ Simulation Mode — keyword-based analysis (no API key needed)'}
+                    </div>
                   </div>
                   <div className="form-group">
                     <label className="form-label">Model Temperature (Physics)</label>
@@ -593,6 +689,15 @@ export default function App() {
                               <Repeat size={13}/> Auto-Harden & Verify
                             </button>
                           )}
+                          {scanId && (
+                            <button
+                              className="btn btn-ghost"
+                              onClick={() => window.open(`${API}/scan/report/${scanId}`, '_blank')}
+                              style={{marginTop:8, borderColor:'var(--green)', color:'var(--green)'}}
+                            >
+                              <Download size={13}/> Export PDF Report
+                            </button>
+                          )}
                         </div>
                         <div style={{flex:1, height:190}}>
                           <ResponsiveContainer width="100%" height="100%">
@@ -647,6 +752,105 @@ export default function App() {
                     <span className="text-xs text-muted">Click "Fix →" for remediation code</span>
                   </div>
                   <VulnTable vulns={results.vulnerabilities}/>
+                </div>
+
+                {/* ── Model Comparison Line Graph (Post-Simulation) ──────── */}
+                <div className="card mt-6 slide-up delay-3">
+                  <div className="card-header">
+                    <div className="card-title"><GitBranch size={14}/> Model Security Comparison — GPT vs Gemini vs Claude</div>
+                    <div style={{display:'flex',gap:12,alignItems:'center'}}>
+                      {['GPT','Gemini','Claude'].map(p => (
+                        <span key={p} style={{display:'flex',alignItems:'center',gap:4,fontSize:'0.7rem',color: PROVIDER_COLORS[p]}}>
+                          <span style={{width:8,height:8,borderRadius:'50%',background:PROVIDER_COLORS[p],display:'inline-block'}}/>
+                          {p} {providerCount[p] ? `(${providerCount[p]})` : '(0)'}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="card-body">
+                    {comparisonData.length > 0 && activeProviders.length > 0 ? (
+                      <>
+                        {/* Per-provider average KPI row */}
+                        <div style={{display:'flex',gap:12,marginBottom:16}}>
+                          {['GPT','Gemini','Claude'].map(p => {
+                            const avg = providerAvg[p];
+                            const count = providerCount[p] || 0;
+                            const color = PROVIDER_COLORS[p];
+                            return (
+                              <div key={p} style={{
+                                flex:1,padding:'12px 16px',borderRadius:10,
+                                background: count ? `${color}11` : 'var(--bg-3)',
+                                border: count ? `1px solid ${color}33` : '1px solid var(--border)',
+                                textAlign:'center',
+                              }}>
+                                <div style={{fontSize:'0.7rem',color: count ? color : 'var(--text-3)',marginBottom:4}}>{p}</div>
+                                <div style={{fontSize:'1.4rem',fontWeight:700,color: count ? color : 'var(--text-3)',fontFamily:'Fira Code'}}>
+                                  {count ? avg : '—'}
+                                </div>
+                                <div style={{fontSize:'0.65rem',color:'var(--text-3)',marginTop:2}}>
+                                  {count ? `${count} scan${count>1?'s':''}` : 'No scans yet'}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {/* Comparison Line Chart */}
+                        <div style={{height:280}}>
+                          <ResponsiveContainer width="100%" height="100%">
+                            <LineChart data={comparisonData}>
+                              <defs>
+                                <linearGradient id="gptGlow2" x1="0" y1="0" x2="0" y2="1">
+                                  <stop offset="0%" stopColor="#58a6ff" stopOpacity={0.3}/>
+                                  <stop offset="100%" stopColor="#58a6ff" stopOpacity={0}/>
+                                </linearGradient>
+                                <linearGradient id="geminiGlow2" x1="0" y1="0" x2="0" y2="1">
+                                  <stop offset="0%" stopColor="#3fb950" stopOpacity={0.3}/>
+                                  <stop offset="100%" stopColor="#3fb950" stopOpacity={0}/>
+                                </linearGradient>
+                                <linearGradient id="claudeGlow2" x1="0" y1="0" x2="0" y2="1">
+                                  <stop offset="0%" stopColor="#a371f7" stopOpacity={0.3}/>
+                                  <stop offset="100%" stopColor="#a371f7" stopOpacity={0}/>
+                                </linearGradient>
+                              </defs>
+                              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)"/>
+                              <XAxis dataKey="scan" stroke="#484f58" tick={{fontSize:10}}/>
+                              <YAxis domain={[0,100]} stroke="#484f58" tick={{fontSize:10}} />
+                              <Tooltip
+                                contentStyle={{background:'var(--bg-2)',border:'1px solid var(--border)',borderRadius:8,fontSize:11}}
+                                formatter={(val, name) => val !== null ? [`${val}/100`, name] : ['—', name]}
+                              />
+                              <Legend wrapperStyle={{fontSize:11,paddingTop:8}}/>
+                              <Line type="monotone" dataKey="GPT" stroke="#58a6ff" strokeWidth={2.5}
+                                dot={{fill:'#58a6ff',r:5,strokeWidth:2,stroke:'#0d1117'}}
+                                activeDot={{r:7,stroke:'#58a6ff',strokeWidth:2}}
+                                connectNulls={false} name="GPT (OpenAI)"
+                                style={{filter:'drop-shadow(0 0 6px #58a6ff66)'}}
+                              />
+                              <Line type="monotone" dataKey="Gemini" stroke="#3fb950" strokeWidth={2.5}
+                                dot={{fill:'#3fb950',r:5,strokeWidth:2,stroke:'#0d1117'}}
+                                activeDot={{r:7,stroke:'#3fb950',strokeWidth:2}}
+                                connectNulls={false} name="Gemini (Google)"
+                                style={{filter:'drop-shadow(0 0 6px #3fb95066)'}}
+                              />
+                              <Line type="monotone" dataKey="Claude" stroke="#a371f7" strokeWidth={2.5}
+                                dot={{fill:'#a371f7',r:5,strokeWidth:2,stroke:'#0d1117'}}
+                                activeDot={{r:7,stroke:'#a371f7',strokeWidth:2}}
+                                connectNulls={false} name="Claude (Anthropic)"
+                                style={{filter:'drop-shadow(0 0 6px #a371f766)'}}
+                              />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="empty-state" style={{padding:'40px 0'}}>
+                        <GitBranch size={36} className="empty-icon"/>
+                        <h4>No comparison data yet</h4>
+                        <p>Scan multiple models (GPT, Gemini, Claude) to see comparisons.</p>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </>
             )}
@@ -798,6 +1002,105 @@ export default function App() {
                       </ResponsiveContainer>
                     ) : <div className="empty-state" style={{padding:'40px 0'}}><p>No failures recorded.</p></div>}
                   </div>
+                </div>
+              </div>
+
+              {/* ── Model Comparison Chart ──────────────────────────────────── */}
+              <div className="card mt-6 slide-up delay-2">
+                <div className="card-header">
+                  <div className="card-title"><GitBranch size={13}/> Model Security Comparison — GPT vs Gemini vs Claude</div>
+                  <div style={{display:'flex',gap:12,alignItems:'center'}}>
+                    {['GPT','Gemini','Claude'].map(p => (
+                      <span key={p} style={{display:'flex',alignItems:'center',gap:4,fontSize:'0.7rem',color: PROVIDER_COLORS[p]}}>
+                        <span style={{width:8,height:8,borderRadius:'50%',background:PROVIDER_COLORS[p],display:'inline-block'}}/>
+                        {p} {providerCount[p] ? `(${providerCount[p]})` : '(0)'}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div className="card-body">
+                  {comparisonData.length > 0 && activeProviders.length > 0 ? (
+                    <>
+                      {/* Per-provider average KPI row */}
+                      <div style={{display:'flex',gap:12,marginBottom:16}}>
+                        {['GPT','Gemini','Claude'].map(p => {
+                          const avg = providerAvg[p];
+                          const count = providerCount[p] || 0;
+                          const color = PROVIDER_COLORS[p];
+                          return (
+                            <div key={p} style={{
+                              flex:1,padding:'12px 16px',borderRadius:10,
+                              background: count ? `${color}11` : 'var(--bg-3)',
+                              border: count ? `1px solid ${color}33` : '1px solid var(--border)',
+                              textAlign:'center',
+                            }}>
+                              <div style={{fontSize:'0.7rem',color: count ? color : 'var(--text-3)',marginBottom:4}}>{p}</div>
+                              <div style={{fontSize:'1.4rem',fontWeight:700,color: count ? color : 'var(--text-3)',fontFamily:'Fira Code'}}>
+                                {count ? avg : '—'}
+                              </div>
+                              <div style={{fontSize:'0.65rem',color:'var(--text-3)',marginTop:2}}>
+                                {count ? `${count} scan${count>1?'s':''}` : 'No scans yet'}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Comparison Line Chart */}
+                      <div style={{height:280}}>
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart data={comparisonData}>
+                            <defs>
+                              <linearGradient id="gptGlow" x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="0%" stopColor="#58a6ff" stopOpacity={0.3}/>
+                                <stop offset="100%" stopColor="#58a6ff" stopOpacity={0}/>
+                              </linearGradient>
+                              <linearGradient id="geminiGlow" x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="0%" stopColor="#3fb950" stopOpacity={0.3}/>
+                                <stop offset="100%" stopColor="#3fb950" stopOpacity={0}/>
+                              </linearGradient>
+                              <linearGradient id="claudeGlow" x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="0%" stopColor="#a371f7" stopOpacity={0.3}/>
+                                <stop offset="100%" stopColor="#a371f7" stopOpacity={0}/>
+                              </linearGradient>
+                            </defs>
+                            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)"/>
+                            <XAxis dataKey="scan" stroke="#484f58" tick={{fontSize:10}}/>
+                            <YAxis domain={[0,100]} stroke="#484f58" tick={{fontSize:10}} />
+                            <Tooltip
+                              contentStyle={{background:'var(--bg-2)',border:'1px solid var(--border)',borderRadius:8,fontSize:11}}
+                              formatter={(val, name) => val !== null ? [`${val}/100`, name] : ['—', name]}
+                            />
+                            <Legend wrapperStyle={{fontSize:11,paddingTop:8}}/>
+                            <Line type="monotone" dataKey="GPT" stroke="#58a6ff" strokeWidth={2.5}
+                              dot={{fill:'#58a6ff',r:5,strokeWidth:2,stroke:'#0d1117'}}
+                              activeDot={{r:7,stroke:'#58a6ff',strokeWidth:2}}
+                              connectNulls={false} name="GPT (OpenAI)"
+                              style={{filter:'drop-shadow(0 0 6px #58a6ff66)'}}
+                            />
+                            <Line type="monotone" dataKey="Gemini" stroke="#3fb950" strokeWidth={2.5}
+                              dot={{fill:'#3fb950',r:5,strokeWidth:2,stroke:'#0d1117'}}
+                              activeDot={{r:7,stroke:'#3fb950',strokeWidth:2}}
+                              connectNulls={false} name="Gemini (Google)"
+                              style={{filter:'drop-shadow(0 0 6px #3fb95066)'}}
+                            />
+                            <Line type="monotone" dataKey="Claude" stroke="#a371f7" strokeWidth={2.5}
+                              dot={{fill:'#a371f7',r:5,strokeWidth:2,stroke:'#0d1117'}}
+                              activeDot={{r:7,stroke:'#a371f7',strokeWidth:2}}
+                              connectNulls={false} name="Claude (Anthropic)"
+                              style={{filter:'drop-shadow(0 0 6px #a371f766)'}}
+                            />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="empty-state" style={{padding:'40px 0'}}>
+                      <GitBranch size={36} className="empty-icon"/>
+                      <h4>No comparison data yet</h4>
+                      <p>Scan multiple models (GPT, Gemini, Claude) to see comparisons.</p>
+                    </div>
+                  )}
                 </div>
               </div>
             </>)}

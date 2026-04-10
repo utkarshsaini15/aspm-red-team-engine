@@ -4,7 +4,14 @@ Implements: Q(s,a) ← Q(s,a) + α[R + γ·maxQ(s',a') - Q(s,a)]
 """
 import random
 import math
+import json
+import tempfile
+import os
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+
+# Path for persisting the Q-table between scans (project root)
+_QTABLE_PATH = Path(__file__).resolve().parent.parent / "qtable_state.json"
 
 
 class QLearningEngine:
@@ -129,3 +136,41 @@ class QLearningEngine:
         for h in self.history:
             freq[h["action"]] = freq.get(h["action"], 0) + 1
         return freq
+
+    # ── Persistence ──────────────────────────────────────────────────────
+    def save(self, path: Optional[Path] = None) -> None:
+        """Persist Q-table atomically so a crashed write never corrupts the file."""
+        save_path = Path(path or _QTABLE_PATH)
+        data = {
+            "q_table":     self.q_table,
+            "epsilon":     self.epsilon,
+            "total_steps": self.total_steps,
+        }
+        try:
+            # Write to a temp file in the same directory, then atomically rename
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=save_path.parent, prefix=".qtable_tmp_", suffix=".json"
+            )
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, save_path)   # atomic on all major OSes
+        except Exception as exc:
+            print(f"[RL] Warning: could not persist Q-table — {exc}")
+
+    def load(self, path: Optional[Path] = None) -> bool:
+        """Load persisted Q-table. Returns True if a saved state was found."""
+        load_path = Path(path or _QTABLE_PATH)
+        if not load_path.exists():
+            return False
+        try:
+            with open(load_path) as f:
+                data = json.load(f)
+            # Validate structure before accepting
+            if not isinstance(data.get("q_table"), dict):
+                return False
+            self.q_table     = data["q_table"]
+            self.epsilon     = max(0.05, float(data.get("epsilon", self.epsilon)))
+            self.total_steps = int(data.get("total_steps", 0))
+            return True
+        except Exception:
+            return False

@@ -97,8 +97,8 @@ class XAIExplainer:
         risk_counts: Dict[str, int] = {}
 
         for v in vulnerabilities:
-            if v["status"] == "Failed":
-                r = v["risk_level"]
+            if v.get("status") == "Failed":
+                r = v.get("risk_level", "Medium")
                 risk_counts[r] = risk_counts.get(r, 0) + 1
 
         for risk, count in risk_counts.items():

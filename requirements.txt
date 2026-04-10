@@ -1,12 +1,9 @@
 fastapi>=0.100.0
 uvicorn>=0.23.0
-streamlit>=1.30.0
 sqlmodel>=0.0.14
-pandas>=2.1.0
-plotly>=5.18.0
-fpdf2
-numpy>=2.7.7
+numpy>=1.26.0
 pydantic>=2.5.0
 litellm>=1.0.0
 requests>=2.31.0
+fpdf2>=2.7.0
 # Note: garak and pyrit can be heavy, for this hackathon we will stub their inputs first to ensure the pipeline works seamlessly

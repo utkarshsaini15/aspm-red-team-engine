@@ -1,7 +1,10 @@
+from pathlib import Path
 from sqlmodel import SQLModel, create_engine, Session
 from src.models import ScanJob
 
-sqlite_file_name = "scans.db"
+# Anchor DB next to the project root regardless of where uvicorn is launched from
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sqlite_file_name = _PROJECT_ROOT / "scans.db"
 sqlite_url = f"sqlite:///{sqlite_file_name}"
 
 connect_args = {"check_same_thread": False}
