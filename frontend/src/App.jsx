@@ -7,12 +7,14 @@ import {
   TrendingUp, Clock, Cpu, Brain, GitBranch,
   Network, Layers, Bug, Shield, Play, Repeat, Download
 } from 'lucide-react';
+import LiveChart from './components/LiveChart';
 import {
   ResponsiveContainer, AreaChart, Area, XAxis, YAxis,
   Tooltip, CartesianGrid, RadarChart, Radar, PolarGrid,
   PolarAngleAxis, PolarRadiusAxis, BarChart, Bar, Cell,
   LineChart, Line, Legend, ScatterChart, Scatter,
 } from 'recharts';
+import './api-modal.css';
 
 const API = 'http://localhost:8000';
 
@@ -24,6 +26,14 @@ const THREATS = [
   '💀 ZERO-DAY: Model inversion attack leaking training corpora via embeddings.',
   '🧬 RL AGENT: Adversarial suffix triggers toxicity at T>0.65 on GPT-4 class models.',
 ];
+
+const COMPARE_MODELS = [
+  { id: 'gemini/gemini-2.0-flash', label: 'Gemini 2.0 Flash', sub: 'Latest · Free tier', color: '#3fb950', badge: 'FREE' },
+  { id: 'gemini/gemini-1.5-flash', label: 'Gemini 1.5 Flash', sub: 'Balanced · Fast',    color: '#58a6ff', badge: 'FAST' },
+  { id: 'gemini/gemini-1.5-pro',   label: 'Gemini 1.5 Pro',   sub: 'Most capable',       color: '#a371f7', badge: 'PRO'  },
+];
+
+const OWASP_SHORT = ['LLM01','LLM02','LLM03','LLM04','LLM05','LLM06','LLM07','LLM08','LLM09','LLM10'];
 
 // ── Log colorizer ─────────────────────────────────────────────────────────────
 function renderLog(raw) {
@@ -297,16 +307,23 @@ export default function App() {
   const [toast, setToast]         = useState(null);
 
   // Scan config
-  const [targetModel,   setTargetModel]   = useState('gpt-4o');
+  const [targetModel,   setTargetModel]   = useState('gemini/gemini-1.5-flash');
   const [temperature,   setTemperature]   = useState(0.5);
   const [systemPrompt,  setSystemPrompt]  = useState('');
-  const [apiKey,        setApiKey]        = useState('');
+  const [apiKey,        setApiKey]        = useState(() => localStorage.getItem('aspm_api_key') || '');
 
   // Primary scan
   const [scanId,     setScanId]     = useState(null);
   const [scanStatus, setScanStatus] = useState(null);
   const [logs,       setLogs]       = useState('');
   const [results,    setResults]    = useState(null);
+  const [scanProgress, setScanProgress] = useState(0);
+
+  // Multi-model comparison
+  const [compareSelected,     setCompareSelected]     = useState(new Set(['gemini/gemini-2.0-flash','gemini/gemini-1.5-flash']));
+  const [compareResults,      setCompareResults]      = useState([]);
+  const [compareStatus,       setCompareStatus]       = useState('idle');   // idle|running|done
+  const [compareCurrentModel, setCompareCurrentModel] = useState('');
 
   // Autonomous hardening
   const [hardenJobId,     setHardenJobId]     = useState(null);
@@ -318,8 +335,52 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const consoleRef = useRef(null);
   const hardenRef  = useRef(null);
+  
+  // API Key Management
+  const [apiKeys, setApiKeys] = useState({});
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  const [availableModels, setAvailableModels] = useState([]);
+  const [usageStats, setUsageStats] = useState({});
 
   const showToast = (msg, type='success') => setToast({msg, type});
+
+  // ── API Key Management ─────────────────────────────────────────────────────
+  const fetchAvailableModels = useCallback(async () => {
+    try {
+      const res = await axios.get(`${API}/config/models`);
+      setAvailableModels(res.data.available_models || []);
+      setUsageStats(res.data.usage || {});
+    } catch (err) {
+      console.error('Failed to fetch models:', err);
+    }
+  }, []);
+
+  const setProviderApiKey = useCallback(async (provider, key) => {
+    try {
+      const res = await axios.post(`${API}/config/api-key`, {
+        provider: provider.toLowerCase(),
+        api_key: key
+      });
+      showToast(res.data.message, 'success');
+      await fetchAvailableModels();
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Failed to set API key', 'error');
+    }
+  }, [fetchAvailableModels]);
+
+  const saveConfiguration = useCallback(async () => {
+    try {
+      const res = await axios.post(`${API}/config/save`);
+      showToast(res.data.message, 'success');
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Failed to save config', 'error');
+    }
+  }, []);
+
+  // Load initial configuration
+  useEffect(() => {
+    fetchAvailableModels();
+  }, [fetchAvailableModels]);
 
   // ── API Health ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -371,9 +432,15 @@ export default function App() {
     es.onmessage = (e) => {
       const line = e.data;
       if (!started) { started = true; setScanStatus('IN_PROGRESS'); }
-      if      (line === '[DONE]')               { es.close(); fetchFinalResults(scanId); }
+      if      (line === '[DONE]')               { es.close(); setScanProgress(10); fetchFinalResults(scanId); }
       else if (line === '[FAIL]')               { es.close(); setScanStatus('FAILED'); showToast('Scan failed — check backend logs.', 'warn'); }
-      else if (line && !line.startsWith('[ERROR]')) { setLogs(prev => prev + line + '\n'); }
+      else if (line && !line.startsWith('[ERROR]')) {
+        setLogs(prev => prev + line + '\n');
+        // Count each completed vector — [RESULT] line fires once per OWASP vector
+        if (line.includes('[RESULT]')) {
+          setScanProgress(prev => Math.min(prev + 1, 10));
+        }
+      }
     };
     es.onerror = () => { es.close(); };
     return () => es.close();
@@ -432,7 +499,7 @@ export default function App() {
   // ── Start Scan ──────────────────────────────────────────────────────────────
   const startScan = async () => {
     if (!apiOnline) { showToast('API offline. Run: uvicorn src.server:app --reload', 'warn'); return; }
-    setResults(null); setLogs(''); setScanId(null); setScanStatus('PENDING');
+    setResults(null); setLogs(''); setScanId(null); setScanStatus('PENDING'); setScanProgress(0);
     setHardenJobId(null); setHardenResults(null); setHardenStatus(null); setHardenLogs('');
     try {
       const { data } = await axios.post(`${API}/scan/start`, {
@@ -462,6 +529,55 @@ export default function App() {
 
   const isScanning = scanStatus === 'PENDING' || scanStatus === 'IN_PROGRESS';
   const isHardening = hardenStatus === 'PENDING' || hardenStatus === 'IN_PROGRESS';
+
+  // ── Multi-Model Comparison ────────────────────────────────────────────────
+  const startCompare = async () => {
+    if (!apiOnline) { showToast('API offline.', 'warn'); return; }
+    const models = COMPARE_MODELS.filter(m => compareSelected.has(m.id)).map(m => m.id);
+    if (models.length < 2) { showToast('Select at least 2 models to compare.', 'warn'); return; }
+    setCompareResults([]); setCompareStatus('running');
+    for (const model of models) {
+      setCompareCurrentModel(model);
+      try {
+        const { data: job } = await axios.post(`${API}/scan/start`, {
+          target_model: model, api_key: apiKey, temperature: 0.5, system_prompt: '',
+        });
+        // Poll until done
+        let done = false;
+        while (!done) {
+          await new Promise(r => setTimeout(r, 1600));
+          const { data: st } = await axios.get(`${API}/scan/status/${job.job_id}`);
+          if (st.status === 'COMPLETED') {
+            setCompareResults(prev => [...prev, { model, results: st.results, jobId: job.job_id }]);
+            done = true;
+          } else if (st.status === 'FAILED') {
+            showToast(`${model} scan failed`, 'warn'); done = true;
+          }
+        }
+      } catch { showToast(`Error scanning ${model}`, 'warn'); }
+    }
+    setCompareStatus('done'); setCompareCurrentModel('');
+    showToast('Comparison complete! 🎉', 'success');
+  };
+
+  const toggleCompareModel = (id) => {
+    setCompareSelected(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  // OWASP cross-model chart data
+  const owaspCompareData = OWASP_SHORT.map(id => {
+    const point = { id };
+    compareResults.forEach(r => {
+      const vuln = r.results?.vulnerabilities?.find(v => v.owasp_id === id);
+      const label = COMPARE_MODELS.find(m => m.id === r.model)?.label || r.model;
+      point[label] = vuln?.status === 'Passed' ? 100 : 0;
+    });
+    return point;
+  });
 
   // ── Analytics ───────────────────────────────────────────────────────────────
   const trendData = [...history].reverse().map(h => ({
@@ -535,7 +651,9 @@ export default function App() {
           <div className="sidebar-section-label">Modules</div>
           {[
             { id:'audit',     label:'Live Red Team',      Icon:Activity },
+            { id:'compare',   label:'Model Compare',      Icon:GitBranch },
             { id:'history',   label:'Posture History',    Icon:History },
+            { id:'livechart', label:'Live Chart',         Icon:BarChart3 },
             { id:'analytics', label:'Executive Analytics',Icon:BarChart3 },
           ].map(({id,label,Icon}) => (
             <div key={id} className={`nav-item ${tab===id?'active':''}`} onClick={()=>setTab(id)}>
@@ -563,8 +681,17 @@ export default function App() {
           </div>
           <div className="threat-ticker">
             <div className="threat-ticker-label"><Zap size={10}/> Live Threat Intel</div>
-            <div className="threat-ticker-msg">{THREATS[threatIdx]}</div>
+            <div className="threat-text">{THREATS[threatIdx]}</div>
           </div>
+          {/* API Key Management Button */}
+          <button 
+            className="api-key-btn"
+            onClick={() => setShowApiKeyModal(true)}
+            title="Manage API Keys"
+          >
+            <Server size={14} />
+            <span>API Keys</span>
+          </button>
         </div>
       </nav>
 
@@ -592,15 +719,30 @@ export default function App() {
                   <div className="form-group">
                     <label className="form-label">Target Model ID</label>
                     <input className="form-input" value={targetModel} onChange={e=>setTargetModel(e.target.value)} placeholder="gpt-4o"/>
-                    <div className="form-hint">LiteLLM format: <code>gpt-4o</code> · <code>gemini/gemini-1.5-flash</code> · <code>anthropic/claude-3-sonnet</code></div>
+                    <div className="form-hint">LiteLLM format: <code>gemini/gemini-1.5-flash</code> · <code>gemini/gemini-2.0-flash</code> · <code>gpt-4o</code> · <code>anthropic/claude-3-sonnet</code></div>
                   </div>
                   <div className="form-group">
-                    <label className="form-label">API Key <span className="form-hint-inline">(Optional — leave blank for simulation)</span></label>
-                    <input
-                      className="form-input" type="password"
-                      value={apiKey} onChange={e=>setApiKey(e.target.value)}
-                      placeholder="sk-...  or  AIzaSy...  or  any provider key"
-                    />
+                    <label className="form-label" style={{display:'flex',alignItems:'center',gap:8}}>
+                      API Key <span className="form-hint-inline">(Optional — leave blank for simulation)</span>
+                      {apiKey && <span style={{fontSize:'0.65rem',background:'rgba(63,185,80,0.15)',color:'var(--green)',border:'1px solid rgba(63,185,80,0.3)',borderRadius:4,padding:'1px 6px'}}>💾 Saved</span>}
+                    </label>
+                    <div style={{display:'flex',gap:6}}>
+                      <input
+                        className="form-input" type="password"
+                        value={apiKey}
+                        onChange={e => { setApiKey(e.target.value); localStorage.setItem('aspm_api_key', e.target.value); }}
+                        placeholder="AIzaSy...  (auto-saved to browser)"
+                        style={{flex:1}}
+                      />
+                      {apiKey && (
+                        <button
+                          className="btn btn-ghost"
+                          style={{padding:'0 10px',fontSize:'0.75rem',borderColor:'var(--red)',color:'var(--red)',flexShrink:0}}
+                          onClick={() => { setApiKey(''); localStorage.removeItem('aspm_api_key'); }}
+                          title="Clear saved API key"
+                        >✕ Clear</button>
+                      )}
+                    </div>
                     <div className="form-hint" style={{color: apiKey ? 'var(--green)' : 'var(--yellow)'}}>
                       {apiKey ? '🤖 Real LLM Mode — live attacks will call the target model' : '⚡ Simulation Mode — keyword-based analysis (no API key needed)'}
                     </div>
@@ -647,9 +789,33 @@ export default function App() {
                   <div className="card slide-up delay-1">
                     <div className="card-header">
                       <div className="card-title"><Activity size={14}/> Live RL Attack Console</div>
-                      <span className="chip chip-yellow" style={{fontSize:'0.7rem'}}>
-                        <div className="spinner" style={{width:8,height:8,borderWidth:1.5}}/>&nbsp;IN PROGRESS
-                      </span>
+                      <div style={{display:'flex', alignItems:'center', gap:10}}>
+                        {/* Progress counter */}
+                        <span style={{fontSize:'0.72rem', color:'var(--text-2)', fontFamily:'monospace'}}>
+                          {scanProgress}/10 vectors
+                        </span>
+                        {/* Circular % badge */}
+                        <span style={{
+                          fontSize:'0.75rem', fontWeight:700, fontFamily:'monospace',
+                          color: scanProgress >= 8 ? 'var(--green)' : scanProgress >= 4 ? 'var(--yellow)' : 'var(--blue)'
+                        }}>
+                          {Math.round(scanProgress * 10)}%
+                        </span>
+                        <span className="chip chip-yellow" style={{fontSize:'0.7rem'}}>
+                          <div className="spinner" style={{width:8,height:8,borderWidth:1.5}}/>&nbsp;IN PROGRESS
+                        </span>
+                      </div>
+                    </div>
+                    {/* Progress bar */}
+                    <div style={{height:3, background:'rgba(255,255,255,0.06)', margin:'0 0 2px 0', borderRadius:0}}>
+                      <div style={{
+                        height:'100%',
+                        width: `${scanProgress * 10}%`,
+                        background: scanProgress >= 8 ? 'var(--green)' : scanProgress >= 4 ? 'var(--yellow)' : 'var(--blue)',
+                        transition: 'width 0.6s cubic-bezier(0.4,0,0.2,1), background 0.4s',
+                        borderRadius: '0 2px 2px 0',
+                        boxShadow: `0 0 8px ${scanProgress >= 8 ? 'var(--green)' : scanProgress >= 4 ? 'var(--yellow)' : 'var(--blue)'}`,
+                      }}/>
                     </div>
                     <div className="terminal-wrapper">
                       <div className="terminal-topbar">
@@ -830,7 +996,7 @@ export default function App() {
                               <Line type="monotone" dataKey="Gemini" stroke="#3fb950" strokeWidth={2.5}
                                 dot={{fill:'#3fb950',r:5,strokeWidth:2,stroke:'#0d1117'}}
                                 activeDot={{r:7,stroke:'#3fb950',strokeWidth:2}}
-                                connectNulls={false} name="Gemini (Google)"
+                                connectNulls={true} name="Gemini (Google)"
                                 style={{filter:'drop-shadow(0 0 6px #3fb95066)'}}
                               />
                               <Line type="monotone" dataKey="Claude" stroke="#a371f7" strokeWidth={2.5}
@@ -1081,7 +1247,7 @@ export default function App() {
                             <Line type="monotone" dataKey="Gemini" stroke="#3fb950" strokeWidth={2.5}
                               dot={{fill:'#3fb950',r:5,strokeWidth:2,stroke:'#0d1117'}}
                               activeDot={{r:7,stroke:'#3fb950',strokeWidth:2}}
-                              connectNulls={false} name="Gemini (Google)"
+                              connectNulls={true} name="Gemini (Google)"
                               style={{filter:'drop-shadow(0 0 6px #3fb95066)'}}
                             />
                             <Line type="monotone" dataKey="Claude" stroke="#a371f7" strokeWidth={2.5}
@@ -1106,9 +1272,312 @@ export default function App() {
             </>)}
           </div>
         )}
+
+        {/* ═══ LIVE CHART TAB ══════════════════════════════════════════════════════ */}
+        {tab === 'livechart' && (
+          <div className="page fade-in">
+            <LiveChart />
+          </div>
+        )}
+
+        {/* ═══ COMPARE TAB ══════════════════════════════════════════════════════ */}
+      {tab === 'compare' && (
+        <div className="page fade-in" style={{position:'absolute',top:0,left:0,right:0,padding:'32px',overflowY:'auto',height:'100%',boxSizing:'border-box'}}>
+          <div className="page-header">
+            <h1 className="page-title">Model <span className="accent">Comparison</span></h1>
+            <p className="page-subtitle">Run identical red-team scans across multiple Gemini models and compare security posture side-by-side.</p>
+          </div>
+
+          {/* Model Selection */}
+          <div className="card slide-up">
+            <div className="card-header">
+              <div className="card-title"><GitBranch size={14}/> Select Models</div>
+              <span className="text-xs text-muted">API key required for real LLM comparison</span>
+            </div>
+            <div className="card-body">
+              <div style={{display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:12, marginBottom:16}}>
+                {COMPARE_MODELS.map(m => {
+                  const selected = compareSelected.has(m.id);
+                  const isActive = compareCurrentModel === m.id;
+                  return (
+                    <div key={m.id}
+                      onClick={() => toggleCompareModel(m.id)}
+                      style={{
+                        padding:'16px', borderRadius:12, cursor:'pointer',
+                        border: selected ? `2px solid ${m.color}` : '2px solid var(--border)',
+                        background: selected ? `${m.color}11` : 'var(--bg-3)',
+                        transition:'all 0.2s', position:'relative',
+                        boxShadow: selected ? `0 0 16px ${m.color}22` : 'none',
+                      }}
+                    >
+                      {isActive && compareStatus === 'running' && (
+                        <div style={{position:'absolute',top:8,right:8}}>
+                          <div className="spinner" style={{width:10,height:10,borderWidth:2,borderColor:`${m.color}44`,borderTopColor:m.color}}/>
+                        </div>
+                      )}
+                      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6}}>
+                        <div style={{width:10,height:10,borderRadius:'50%',background:m.color,flexShrink:0,
+                          boxShadow: selected ? `0 0 8px ${m.color}` : 'none'}}/>
+                        <span style={{fontSize:'0.65rem',fontWeight:700,color:m.color,letterSpacing:'0.05em'}}>{m.badge}</span>
+                      </div>
+                      <div style={{fontSize:'0.85rem',fontWeight:600,color: selected ? m.color : 'var(--text-1)',marginBottom:2}}>{m.label}</div>
+                      <div style={{fontSize:'0.68rem',color:'var(--text-3)'}}>{m.sub}</div>
+                      <div style={{fontSize:'0.62rem',fontFamily:'monospace',color:'var(--text-3)',marginTop:6, opacity:0.7}}>{m.id}</div>
+                      <div style={{position:'absolute',top:12,right:12,width:18,height:18,borderRadius:4,
+                        border: selected ? `2px solid ${m.color}` : '2px solid var(--border)',
+                        background: selected ? m.color : 'transparent',
+                        display:'flex',alignItems:'center',justifyContent:'center',fontSize:11
+                      }}>{selected ? '✓' : ''}</div>
+                    </div>
+                  );
+                })}
+              </div>
+              <button
+                className="btn btn-launch"
+                disabled={compareStatus === 'running' || compareSelected.size < 2}
+                onClick={startCompare}
+                style={{width:'100%'}}
+              >
+                {compareStatus === 'running' ? (
+                  <><div className="spinner"/> Scanning {compareCurrentModel.split('/')[1] || ''}... ({compareResults.length}/{compareSelected.size} done)</>
+                ) : (
+                  <><Play size={14}/> Run Comparison ({compareSelected.size} models)</>
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Live Progress */}
+          {compareStatus === 'running' && (
+            <div className="card slide-up" style={{marginTop:12}}>
+              <div style={{height:4,background:'var(--bg-3)',borderRadius:2}}>
+                <div style={{
+                  height:'100%', borderRadius:2,
+                  width:`${(compareResults.length / compareSelected.size) * 100}%`,
+                  background:'linear-gradient(90deg,var(--blue),var(--green))',
+                  transition:'width 0.8s cubic-bezier(0.4,0,0.2,1)',
+                  boxShadow:'0 0 12px var(--blue)',
+                }}/>
+              </div>
+              <div style={{padding:'10px 16px',fontSize:'0.75rem',color:'var(--text-2)'}}>
+                ⟳ Scanning {compareCurrentModel} — {compareResults.length} of {compareSelected.size} complete
+              </div>
+            </div>
+          )}
+
+          {/* Results: Score Cards */}
+          {compareResults.length > 0 && (
+            <>
+              <div style={{display:'grid', gridTemplateColumns:`repeat(${compareResults.length},1fr)`, gap:14, marginTop:16}}>
+                {compareResults.map((r, i) => {
+                  const m = COMPARE_MODELS.find(x => x.id === r.model) || { color:'#58a6ff', label: r.model };
+                  const score = r.results?.score ?? 0;
+                  const vulns = r.results?.vulnerabilities || [];
+                  const passed = vulns.filter(v => v.status === 'Passed').length;
+                  const failed = vulns.filter(v => v.status === 'Failed').length;
+                  const critical = vulns.filter(v => v.status === 'Failed' && v.risk_level === 'Critical').length;
+                  return (
+                    <div key={i} className="card slide-up" style={{
+                      border:`1px solid ${m.color}33`,
+                      background:`${m.color}08`,
+                    }}>
+                      <div className="card-header" style={{borderBottomColor:`${m.color}22`}}>
+                        <div style={{fontSize:'0.8rem',fontWeight:700,color:m.color}}>{m.label}</div>
+                        {r.results?.scan_mode && (
+                          <span className="chip" style={{fontSize:'0.6rem',background:`${m.color}22`,color:m.color,border:`1px solid ${m.color}44`}}>
+                            {r.results.scan_mode === 'real_llm' ? '🤖 Real' : '⚡ Sim'}
+                          </span>
+                        )}
+                      </div>
+                      <div className="card-body" style={{display:'flex',flexDirection:'column',alignItems:'center',gap:12}}>
+                        <ScoreRing score={score} size={100}/>
+                        <div style={{display:'flex',gap:8,flexWrap:'wrap',justifyContent:'center'}}>
+                          <span className="chip chip-green">{passed} ✓ Passed</span>
+                          {failed > 0 && <span className="chip chip-red">{failed} ✗ Failed</span>}
+                          {critical > 0 && <span className="chip chip-red">{critical} Critical</span>}
+                        </div>
+                        {r.jobId && (
+                          <button
+                            className="btn btn-ghost"
+                            style={{fontSize:'0.7rem',padding:'4px 12px',borderColor:m.color,color:m.color,width:'100%'}}
+                            onClick={() => window.open(`${API}/scan/report/${r.jobId}`, '_blank')}
+                          ><Download size={11}/> PDF Report</button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Winner Banner */}
+              {compareStatus === 'done' && compareResults.length >= 2 && (() => {
+                const best = [...compareResults].sort((a,b) => (b.results?.score||0) - (a.results?.score||0))[0];
+                const m = COMPARE_MODELS.find(x => x.id === best.model) || { color:'#3fb950', label: best.model };
+                return (
+                  <div style={{
+                    marginTop:14, padding:'14px 20px', borderRadius:12,
+                    background:`linear-gradient(135deg, ${m.color}18, ${m.color}08)`,
+                    border:`1px solid ${m.color}44`, display:'flex', alignItems:'center', gap:12,
+                  }}>
+                    <span style={{fontSize:'1.5rem'}}>🏆</span>
+                    <div>
+                      <div style={{fontSize:'0.85rem',fontWeight:700,color:m.color}}>Most Secure: {m.label}</div>
+                      <div style={{fontSize:'0.72rem',color:'var(--text-2)'}}>Highest security score ({best.results?.score}/100) across all tested models</div>
+                    </div>
+                    <div style={{marginLeft:'auto',fontSize:'1.8rem',fontWeight:900,fontFamily:'Fira Code',color:m.color}}>{best.results?.score}</div>
+                  </div>
+                );
+              })()}
+
+              {/* OWASP Cross-model Bar Chart */}
+              {compareResults.length >= 2 && (
+                <div className="card slide-up" style={{marginTop:14}}>
+                  <div className="card-header">
+                    <div className="card-title"><BarChart3 size={14}/> OWASP Vector Pass Rate by Model</div>
+                    <div style={{display:'flex',gap:10}}>
+                      {compareResults.map((r,i) => {
+                        const m = COMPARE_MODELS.find(x => x.id === r.model) || { color:'#58a6ff', label: r.model.split('/')[1] };
+                        return <span key={i} style={{fontSize:'0.68rem',color:m.color,display:'flex',alignItems:'center',gap:4}}>
+                          <span style={{width:8,height:8,borderRadius:2,background:m.color,display:'inline-block'}}/>{m.label}
+                        </span>;
+                      })}
+                    </div>
+                  </div>
+                  <div className="card-body" style={{height:280}}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={owaspCompareData} barCategoryGap="20%" barGap={3}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false}/>
+                        <XAxis dataKey="id" stroke="#484f58" tick={{fontSize:9}}/>
+                        <YAxis domain={[0,100]} stroke="#484f58" tick={{fontSize:9}} tickFormatter={v => `${v}%`}/>
+                        <Tooltip
+                          contentStyle={{background:'var(--bg-2)',border:'1px solid var(--border)',borderRadius:8,fontSize:11}}
+                          formatter={(v, name) => [`${v === 100 ? 'PASSED ✓' : 'FAILED ✗'}`, name]}
+                        />
+                        {compareResults.map((r, i) => {
+                          const m = COMPARE_MODELS.find(x => x.id === r.model);
+                          const color = m?.color || ['#3fb950','#58a6ff','#a371f7'][i % 3];
+                          const label = m?.label || r.model.split('/')[1];
+                          return <Bar key={i} dataKey={label} fill={color} radius={[3,3,0,0]}
+                            style={{filter:`drop-shadow(0 0 4px ${color}66)`}}
+                          />;
+                        })}
+                        <Legend wrapperStyle={{fontSize:11,paddingTop:8}}/>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {compareStatus === 'idle' && compareResults.length === 0 && (
+            <div className="card slide-up" style={{marginTop:14}}>
+              <div className="empty-state" style={{padding:'50px 0'}}>
+                <GitBranch size={48} className="empty-icon"/>
+                <h4>Select models above and click Run Comparison</h4>
+                <p>Each model will be scanned against the full OWASP LLM Top 10 attack suite.<br/>Results will appear side-by-side for easy comparison.</p>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       </main>
 
       {toast && <Toast message={toast.msg} type={toast.type} onClose={()=>setToast(null)}/>}
+      
+      {/* API Key Management Modal */}
+      {showApiKeyModal && (
+        <div className="modal-overlay" onClick={() => setShowApiKeyModal(false)}>
+          <div className="modal-content" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3><Server size={18} /> API Key Management</h3>
+              <button onClick={() => setShowApiKeyModal(false)} className="modal-close">×</button>
+            </div>
+            
+            <div className="modal-body">
+              {/* Usage Stats */}
+              {usageStats.total_cost !== undefined && (
+                <div className="usage-stats">
+                  <h4>Usage Statistics</h4>
+                  <div className="stats-grid">
+                    <div className="stat-item">
+                      <span className="stat-label">Total Cost</span>
+                      <span className="stat-value">${usageStats.total_cost?.toFixed(4) || '0.0000'}</span>
+                    </div>
+                    <div className="stat-item">
+                      <span className="stat-label">Requests</span>
+                      <span className="stat-value">{usageStats.request_count || 0}</span>
+                    </div>
+                    <div className="stat-item">
+                      <span className="stat-label">Avg Cost/Req</span>
+                      <span className="stat-value">${usageStats.average_cost_per_request?.toFixed(4) || '0.0000'}</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+              
+              {/* API Key Forms */}
+              <div className="api-key-forms">
+                <h4>Configure API Keys</h4>
+                
+                <div className="provider-section">
+                  <label>OpenAI (GPT Models)</label>
+                  <input
+                    type="password"
+                    placeholder="sk-..."
+                    onChange={(e) => setProviderApiKey('openai', e.target.value)}
+                  />
+                  <small>Enables: GPT-4o, GPT-4o-mini</small>
+                </div>
+                
+                <div className="provider-section">
+                  <label>Anthropic (Claude Models)</label>
+                  <input
+                    type="password"
+                    placeholder="sk-ant-..."
+                    onChange={(e) => setProviderApiKey('anthropic', e.target.value)}
+                  />
+                  <small>Enables: Claude-3-Sonnet, Claude-3-Haiku</small>
+                </div>
+                
+                <div className="provider-section">
+                  <label>Google (Gemini Models)</label>
+                  <input
+                    type="password"
+                    placeholder="AIza..."
+                    onChange={(e) => setProviderApiKey('google', e.target.value)}
+                  />
+                  <small>Enables: Gemini-1.5-Pro, Gemini-1.5-Flash</small>
+                </div>
+              </div>
+              
+              {/* Available Models */}
+              {availableModels.length > 0 && (
+                <div className="available-models">
+                  <h4>Available Models</h4>
+                  <div className="models-list">
+                    {availableModels.map(model => (
+                      <div key={model} className="model-item">
+                        <span className="model-name">{model}</span>
+                        <span className="model-status">✓ Configured</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            
+            <div className="modal-footer">
+              <button onClick={saveConfiguration} className="btn-primary">
+                <Download size={14} /> Save Configuration
+              </button>
+              <button onClick={() => setShowApiKeyModal(false)} className="btn-secondary">
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -2,16 +2,19 @@ import json
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from sqlmodel import Session, select
 from pydantic import BaseModel
 
-from src.database import create_db_and_tables, engine
+from src.database import get_session, create_db_and_tables, engine
 from src.models import ScanJob
 from src.scanners import run_security_scan_generator
-
+from src.report import generate_pdf_report
+from src.config import llm_config, CONFIG_FILE_PATH
+from src.llm_client import llm_client
+from src.live_chart import websocket_manager, get_chart_data, get_all_metrics
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -43,7 +46,19 @@ class ScanRequest(BaseModel):
     api_key: str = ""   # Provider key — leave empty for simulation mode
 
 
-class HardenRequest(BaseModel):
+class HardeningRequest(BaseModel):
+    system_prompt: str = ""
+    temperature: float = 0.5
+    api_key: str = ""   # forwarded to the background scan
+
+
+class APIKeyRequest(BaseModel):
+    provider: str  # openai, anthropic, google
+    api_key: str
+
+
+class ConfigUpdateRequest(BaseModel):
+    providers: dict
     api_key: str = ""
 
 
@@ -117,7 +132,7 @@ def start_scan(req: ScanRequest, bg: BackgroundTasks):
 
 
 @app.post("/scan/harden-and-verify/{job_id}")
-def harden_and_verify(job_id: str, req: HardenRequest, bg: BackgroundTasks):
+def harden_and_verify(job_id: str, req: HardeningRequest, bg: BackgroundTasks):
     """
     Autonomous Hardening Loop:
     Takes results of job_id, uses the auto-generated hardened_prompt,
@@ -245,20 +260,83 @@ def download_report(job_id: str):
 
 
 @app.get("/scans/history")
-def get_history():
+def get_scan_history():
+    """Return all completed scans (latest first)."""
     with Session(engine) as session:
         stmt = select(ScanJob).where(ScanJob.status == "COMPLETED").order_by(ScanJob.completed_at.desc())
         jobs = session.exec(stmt).all()
-        history = []
-        for job in jobs:
-            if job.results:
-                history.append({
-                    "job_id":       job.id,
-                    "target_model": job.target_model,
-                    "completed_at": job.completed_at.isoformat(),
-                    "results":      json.loads(job.results),
-                })
-        return history
+        return [{"job_id":        job.id,
+                 "target_model":  job.target_model,
+                 "status":        job.status,
+                 "completed_at":  job.completed_at.isoformat() if job.completed_at else None,
+                 "results":       json.loads(job.results) if job.results else None}
+                for job in jobs]
+
+# ── API Key Management ───────────────────────────────────────────────────────
+@app.get("/config/models")
+def get_available_models():
+    """Get list of available LLM models and their configuration status."""
+    return {
+        "available_models": llm_config.get_available_models(),
+        "default_model": llm_config.default_provider,
+        "providers": {
+            model: {
+                "configured": True,
+                "rate_limit_rpm": config.rate_limit_rpm,
+                "cost_per_1k_tokens": config.cost_per_1k_tokens
+            }
+            for model, config in llm_config.providers.items()
+        }
+    }
+
+@app.post("/config/api-key")
+def set_api_key(request: APIKeyRequest):
+    """Set API key for a provider (runtime only, not persisted)."""
+    try:
+        # Map provider name to models
+        provider_models = {
+            "openai": ["gpt-4o", "gpt-4o-mini"],
+            "anthropic": ["anthropic/claude-3-sonnet", "anthropic/claude-3-haiku"],
+            "google": ["gemini/gemini-1.5-pro", "gemini/gemini-1.5-flash", "gemini/gemini-2.0-flash"]
+        }
+        
+        models = provider_models.get(request.provider.lower())
+        if not models:
+            raise HTTPException(status_code=400, detail="Invalid provider")
+        
+        # Update configuration in memory
+        for model in models:
+            if model in llm_config.providers:
+                llm_config.providers[model].api_key = request.api_key
+        
+        return {"message": f"API key set for {request.provider}", "models_updated": models}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/usage/stats")
+def get_usage_stats():
+    """Get current usage statistics and costs."""
+    return llm_client.get_usage_stats()
+
+@app.post("/config/save")
+def save_configuration():
+    """Save current configuration to file."""
+    try:
+        llm_config.save_to_file(CONFIG_FILE_PATH)
+        return {"message": "Configuration saved successfully", "path": str(CONFIG_FILE_PATH)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/config/load")
+def load_configuration():
+    """Load configuration from file."""
+    try:
+        global llm_config
+        llm_config = llm_config.__class__.load_from_file(CONFIG_FILE_PATH)
+        return {"message": "Configuration loaded successfully", "path": str(CONFIG_FILE_PATH)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/scans/history")
@@ -268,3 +346,37 @@ def clear_history():
             session.delete(job)
         session.commit()
     return {"message": "History cleared"}
+
+# ---- Live Chart Endpoints ----
+
+@app.websocket("/ws/live-chart")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for live chart updates"""
+    await websocket_manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive and handle incoming messages
+            data = await websocket.receive_text()
+            # Echo back or process any client messages if needed
+            await websocket_manager.send_personal_message(f"Received: {data}", websocket)
+    except WebSocketDisconnect:
+        websocket_manager.disconnect(websocket)
+
+@app.get("/chart/data")
+async def get_chart_data_endpoint(metric: str = "vulnerability_score", points: int = 20):
+    """Get historical chart data for a specific metric"""
+    return await get_chart_data(metric, points)
+
+@app.get("/chart/metrics")
+async def get_all_metrics_endpoint():
+    """Get all current metrics"""
+    return await get_all_metrics()
+
+@app.get("/chart/status")
+async def get_chart_status():
+    """Get live chart connection status"""
+    return {
+        "active_connections": len(websocket_manager.active_connections),
+        "is_broadcasting": websocket_manager.is_running,
+        "current_phase": websocket_manager.simulator.scan_phase if websocket_manager.simulator else "idle"
+    }

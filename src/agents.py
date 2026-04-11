@@ -27,29 +27,24 @@ async def call_target_llm(
     temperature: float, api_key: str = ""
 ) -> Tuple[Optional[str], Optional[str], float]:
     """Send an attack payload to the real target LLM. Returns (response, error, latency)."""
-    import litellm
-    t_start = time.perf_counter()
+    from src.llm_client import llm_client
+    
     try:
-        messages = []
-        if system_prompt.strip():
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": payload})
-        kwargs: Dict = {
-            "model":       model,
-            "messages":    messages,
-            "temperature": temperature,
-            "max_tokens":  400,
-        }
-        # Only inject api_key when provided — passing None/empty confuses LiteLLM
-        # and causes auth errors even when env vars are set correctly.
-        if api_key and api_key.strip():
-            kwargs["api_key"] = api_key.strip()
-        response = await litellm.acompletion(**kwargs)
-        latency  = round(time.perf_counter() - t_start, 2)
-        return response.choices[0].message.content, None, latency
+        response = await llm_client.call_with_system_prompt(
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=payload,
+            temperature=temperature,
+            api_key=api_key if api_key.strip() else None
+        )
+        
+        if response.error:
+            return None, response.error, response.latency
+        
+        return response.content, None, response.latency
+        
     except Exception as exc:
-        latency = round(time.perf_counter() - t_start, 2)
-        return None, str(exc)[:80], latency
+        return None, str(exc)[:80], 0.0
 
 
 def detect_breach(owasp_id: str, response: str) -> bool:
